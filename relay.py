@@ -107,7 +107,6 @@ async def hosta_baglan(viewer_ws, oda_adi, host_id):
         })
         return None
 
-    # Önceki bilgisayar bağlantısını bırak.
     for hid, h in list(oda["hosts"].items()):
         if hid != host_id and h["viewer"] is viewer_ws:
             h["viewer"] = None
@@ -154,7 +153,6 @@ async def host_handler(ws, oda_adi, bilgi):
 
             eski_viewer = eski_host.get("viewer")
 
-            # Eski bağlantının mesaj göndermesini durdur.
             try:
                 await asyncio.wait_for(
                     eski_ws.close(
@@ -203,7 +201,6 @@ async def host_handler(ws, oda_adi, bilgi):
     try:
         async for mesaj in ws:
 
-            # Eski bağlantı artık veri gönderemez.
             if oda["hosts"].get(host_id) is not host:
                 break
 
@@ -238,6 +235,10 @@ async def host_handler(ws, oda_adi, bilgi):
                     if host["viewer"] is viewer:
                         host["viewer"] = None
                     await host_listesi_gonder(oda_adi)
+                except Exception as e:
+                    logging.warning(
+                        "[HOST] Viewer'a gönderilemedi: %s", e
+                    )
 
     except ConnectionClosed as e:
         logging.warning(
@@ -249,7 +250,6 @@ async def host_handler(ws, oda_adi, bilgi):
         logging.exception("[HOST] Beklenmeyen hata")
 
     finally:
-        # KRİTİK: Eski bağlantı yeni HOST'u silemez.
         if oda["hosts"].get(host_id) is host:
             oda["hosts"].pop(host_id, None)
 
@@ -335,6 +335,11 @@ async def viewer_handler(ws, oda_adi):
                     if host["viewer"] is ws:
                         host["viewer"] = None
                     hedef_host_id = None
+                except Exception as e:
+                    logging.warning(
+                        "[VIEWER] HOST'a gönderilemedi: %s", e
+                    )
+                    hedef_host_id = None
 
     except ConnectionClosed:
         pass
@@ -343,7 +348,6 @@ async def viewer_handler(ws, oda_adi):
         logging.exception("[VIEWER] Hata")
 
     finally:
-        # Viewer'ın bağlı olduğu tüm HOST kayıtlarını temizle.
         for host in list(oda["hosts"].values()):
             if host["viewer"] is ws:
                 host["viewer"] = None
