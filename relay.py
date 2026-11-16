@@ -211,24 +211,14 @@ async def handler(ws):
     except Exception:
         logging.exception("[HANDLER] Hata")
 
-# RENDER HEALTH CHECK İÇİN (Düzeltildi: Websocket ise karışmıyor)
-async def process_request(connection, request):
-    # Eğer bu bir WebSocket upgrade isteğiyse, None dönüp bağlantının devam etmesini sağla
-    if request.headers.get("Upgrade", "").lower() == "websocket":
-        return None
-    # Değilse (Render'ın sağlık kontrolü vs.) 200 OK dön
-    return (200, "OK", [], b"Relay is running")
-
 async def main():
     logging.info("================================")
-    logging.info(" EKRAN PAYLASIM RELAY (v4 - Fix)")
+    logging.info(" EKRAN PAYLASIM RELAY (v6 - Final)")
     logging.info(" Port: %s", PORT)
     logging.info("================================")
     async with websockets.serve(
         handler, HOST, PORT,
-        process_request=process_request,
-        max_size=None, ping_interval=20, ping_timeout=30, close_timeout=5,
-        origins=None
+        max_size=None, ping_interval=20, ping_timeout=30, close_timeout=5
     ):
         await asyncio.Future()
 
