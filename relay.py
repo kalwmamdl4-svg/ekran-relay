@@ -151,11 +151,9 @@ async def viewer_handler(ws, oda_adi):
                         yeni_hedef = await hosta_baglan(ws, oda_adi, yeni_id)
                         if yeni_hedef: hedef_host_id = yeni_hedef
                         continue
-                    # YENİ: relay seviyesinde ping-pong (Render idle kopmasını engeller)
                     if mesaj_tipi == "ping":
                         await mesaj_gonder(ws, {"type": "pong", "t": veri.get("t")})
                         continue
-                    # YENİ: manual list_hosts
                     if mesaj_tipi == "list_hosts":
                         await mesaj_gonder(ws, {"type": "host_list", "hosts": host_listesi_hazirla(oda_adi)})
                         continue
@@ -213,14 +211,22 @@ async def handler(ws):
     except Exception:
         logging.exception("[HANDLER] Hata")
 
+# RENDER HEALTH CHECK İÇİN (400 Bad Request hatasını çözer)
+async def process_request(connection, request):
+    if request.path == "/" and "Upgrade" not in request.headers:
+        return (200, "OK", [], b"Relay is running")
+    return None
+
 async def main():
     logging.info("================================")
-    logging.info(" EKRAN PAYLASIM RELAY (v2)")
+    logging.info(" EKRAN PAYLASIM RELAY (v3)")
     logging.info(" Port: %s", PORT)
     logging.info("================================")
     async with websockets.serve(
         handler, HOST, PORT,
-        max_size=None, ping_interval=20, ping_timeout=30, close_timeout=5
+        process_request=process_request,
+        max_size=None, ping_interval=20, ping_timeout=30, close_timeout=5,
+        origins=None  # Tüm origin'lere (Render proxy) izin ver
     ):
         await asyncio.Future()
 
