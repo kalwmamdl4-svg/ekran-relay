@@ -213,7 +213,7 @@ async def handler(ws):
 
 async def main():
     logging.info("================================")
-    logging.info(" EKRAN PAYLASIM RELAY (v6 - Final)")
+    logging.info(" EKRAN PAYLASIM RELAY (v7 - Stable)")
     logging.info(" Port: %s", PORT)
     logging.info("================================")
     async with websockets.serve(
