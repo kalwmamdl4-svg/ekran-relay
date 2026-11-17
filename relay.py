@@ -21,6 +21,12 @@ odalar = {}
 def oda_al(oda_adi):
     return odalar.setdefault(oda_adi, {"hosts": {}, "viewers": set()})
 
+def oda_temizle(oda_adi):
+    oda = odalar.get(oda_adi)
+    if oda is not None and not oda["hosts"] and not oda["viewers"]:
+        odalar.pop(oda_adi, None)
+        logging.info("[ODA] Temizlendi: %s", oda_adi)
+
 def durum_hesapla(idle_seconds):
     if idle_seconds < 60: return "active"
     if idle_seconds < 300: return "idle"
@@ -164,6 +170,7 @@ async def host_handler(ws, oda_adi, bilgi):
                 await mesaj_gonder(viewer, {"type": "peer_left"})
             await host_listesi_gonder(oda_adi)
             logging.info("[HOST] Ayrıldı | ID=%s", host_id)
+        oda_temizle(oda_adi)
 
 async def viewer_handler(ws, oda_adi):
     oda = oda_al(oda_adi)
@@ -228,6 +235,7 @@ async def viewer_handler(ws, oda_adi):
         oda["viewers"].discard(ws)
         await host_listesi_gonder(oda_adi)
         logging.info("[VIEWER] Ayrıldı | Oda=%s", oda_adi)
+        oda_temizle(oda_adi)
 
 async def handler(ws):
     try:
