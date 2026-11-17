@@ -7,8 +7,9 @@ import logging
 import websockets
 from websockets.exceptions import ConnectionClosed
 
+# 0.0.0.0 tüm ağlardan gelen bağlantıları dinler
 HOST = "0.0.0.0"
-PORT = int(os.environ.get("PORT", "8080"))
+PORT = 8080
 
 logging.basicConfig(
     level=logging.INFO,
@@ -262,6 +263,7 @@ async def main():
         ping_timeout=30,
         close_timeout=3,
     ):
+        logging.info(f"Sunucu başlatıldı. Port: {PORT} - Dışarıdan bağlantı bekleniyor...")
         await asyncio.Future()
 
 if __name__ == "__main__":
