@@ -17,16 +17,13 @@ logging.basicConfig(
 
 odalar = {}
 
-
 def oda_al(oda_adi):
     return odalar.setdefault(oda_adi, {"hosts": {}, "viewers": set()})
-
 
 def durum_hesapla(idle_seconds):
     if idle_seconds < 60: return "active"
     if idle_seconds < 300: return "idle"
     return "afk"
-
 
 def host_listesi_hazirla(oda_adi):
     oda = odalar.get(oda_adi)
@@ -44,7 +41,6 @@ def host_listesi_hazirla(oda_adi):
         for host_id, host in oda["hosts"].items()
     ]
 
-
 async def mesaj_gonder(ws, veri):
     try:
         await ws.send(json.dumps(veri))
@@ -55,7 +51,6 @@ async def mesaj_gonder(ws, veri):
         logging.warning("Mesaj gönderilemedi: %s", e)
         return False
 
-
 async def host_listesi_gonder(oda_adi):
     oda = odalar.get(oda_adi)
     if not oda: return
@@ -63,7 +58,6 @@ async def host_listesi_gonder(oda_adi):
     for viewer in list(oda["viewers"]):
         if not await mesaj_gonder(viewer, veri):
             oda["viewers"].discard(viewer)
-
 
 async def hosta_baglan(viewer_ws, oda_adi, host_id):
     oda = odalar.get(oda_adi)
@@ -75,10 +69,9 @@ async def hosta_baglan(viewer_ws, oda_adi, host_id):
         await mesaj_gonder(viewer_ws, {"type": "error", "message": "Bilgisayar çevrimiçi değil."})
         return None
     if host["viewer"] is not None and host["viewer"] is not viewer_ws:
-        await mesaj_gonder(viewer_ws, {"type": "host_busy", "host_id": host_id,
-                                       "message": "Bilgisayara başka biri bağlı."})
+        await mesaj_gonder(viewer_ws, {"type": "host_busy", "host_id": host_id, "message": "Bilgisayara başka biri bağlı."})
         return None
-    # Aynı viewer başka host'a bağlıysa onu bırak
+    
     for hid, h in list(oda["hosts"].items()):
         if hid != host_id and h["viewer"] is viewer_ws:
             h["viewer"] = None
@@ -91,7 +84,6 @@ async def hosta_baglan(viewer_ws, oda_adi, host_id):
         await mesaj_gonder(host["ws"], {"type": "viewer_joined"})
     await host_listesi_gonder(oda_adi)
     return host_id
-
 
 async def host_handler(ws, oda_adi, bilgi):
     oda = oda_al(oda_adi)
@@ -107,8 +99,7 @@ async def host_handler(ws, oda_adi, bilgi):
             eski_viewer = eski_host.get("viewer")
             try:
                 await asyncio.wait_for(eski_ws.close(code=4001, reason="Yeni HOST bağlantısı"), timeout=3)
-            except Exception:
-                pass
+            except Exception: pass
 
     host = {
         "ws": ws,
@@ -136,15 +127,11 @@ async def host_handler(ws, oda_adi, bilgi):
             if oda["hosts"].get(host_id) is not host: break
 
             if isinstance(mesaj, str):
-                try:
-                    veri = json.loads(mesaj)
-                except json.JSONDecodeError:
-                    veri = None
+                try: veri = json.loads(mesaj)
+                except json.JSONDecodeError: veri = None
 
                 if isinstance(veri, dict):
                     tip = veri.get("type")
-
-                    # Host presence → relay'e özel, viewer'a forward etme
                     if tip == "presence":
                         host["online_seconds"] = int(veri.get("online_seconds") or 0)
                         host["idle_seconds"] = int(veri.get("idle_seconds") or 0)
@@ -153,19 +140,16 @@ async def host_handler(ws, oda_adi, bilgi):
                         await host_listesi_gonder(oda_adi)
                         continue
 
-                    # Host ping → relay direkt pong dönsün, viewer'a forward etme
                     if tip == "ping":
                         await mesaj_gonder(ws, {"type": "pong", "t": veri.get("t")})
                         continue
 
-            # Diğer her şey (frame, kontrol, dosya vb.) → viewer'a forward
             viewer = host.get("viewer")
             if viewer is not None:
                 try:
                     await viewer.send(mesaj)
                 except ConnectionClosed:
-                    if host["viewer"] is viewer:
-                        host["viewer"] = None
+                    if host["viewer"] is viewer: host["viewer"] = None
                     await host_listesi_gonder(oda_adi)
     except ConnectionClosed as e:
         logging.warning("[HOST] Bağlantı kesildi | ID=%s | Kod=%s", host_id, e.code)
@@ -180,7 +164,6 @@ async def host_handler(ws, oda_adi, bilgi):
             await host_listesi_gonder(oda_adi)
             logging.info("[HOST] Ayrıldı | ID=%s", host_id)
 
-
 async def viewer_handler(ws, oda_adi):
     oda = oda_al(oda_adi)
     oda["viewers"].add(ws)
@@ -192,10 +175,8 @@ async def viewer_handler(ws, oda_adi):
     try:
         async for mesaj in ws:
             if isinstance(mesaj, str):
-                try:
-                    veri = json.loads(mesaj)
-                except json.JSONDecodeError:
-                    veri = None
+                try: veri = json.loads(mesaj)
+                except json.JSONDecodeError: veri = None
 
                 if isinstance(veri, dict):
                     mesaj_tipi = veri.get("type")
@@ -204,18 +185,15 @@ async def viewer_handler(ws, oda_adi):
                         yeni_id = veri.get("host_id")
                         if not yeni_id: continue
                         yeni_hedef = await hosta_baglan(ws, oda_adi, yeni_id)
-                        if yeni_hedef:
-                            hedef_host_id = yeni_hedef
+                        if yeni_hedef: hedef_host_id = yeni_hedef
                         continue
 
                     if mesaj_tipi == "ping":
-                        # Viewer'ın ping'i → relay direkt pong dönsün (viewer'ın ping ölçümü için)
                         await mesaj_gonder(ws, {"type": "pong", "t": veri.get("t")})
                         continue
 
                     if mesaj_tipi == "list_hosts":
-                        await mesaj_gonder(ws, {"type": "host_list",
-                                                "hosts": host_listesi_hazirla(oda_adi)})
+                        await mesaj_gonder(ws, {"type": "host_list", "hosts": host_listesi_hazirla(oda_adi)})
                         continue
 
                     if mesaj_tipi == "disconnect_host":
@@ -228,7 +206,6 @@ async def viewer_handler(ws, oda_adi):
                         await host_listesi_gonder(oda_adi)
                         continue
 
-            # Viewer'dan gelen diğer her şey (kontrol, dosya, sys_cmd, troll...) → host'a forward
             if hedef_host_id:
                 host = oda["hosts"].get(hedef_host_id)
                 if not host or host["viewer"] is not ws:
@@ -237,11 +214,9 @@ async def viewer_handler(ws, oda_adi):
                 try:
                     await host["ws"].send(mesaj)
                 except ConnectionClosed:
-                    if host["viewer"] is ws:
-                        host["viewer"] = None
+                    if host["viewer"] is ws: host["viewer"] = None
                     hedef_host_id = None
-    except ConnectionClosed:
-        pass
+    except ConnectionClosed: pass
     except Exception as e:
         logging.warning("[VIEWER] Hata | %s", e)
     finally:
@@ -253,25 +228,19 @@ async def viewer_handler(ws, oda_adi):
         await host_listesi_gonder(oda_adi)
         logging.info("[VIEWER] Ayrıldı | Oda=%s", oda_adi)
 
-
 async def handler(ws):
     try:
         ilk_mesaj = await asyncio.wait_for(ws.recv(), timeout=15)
         if not isinstance(ilk_mesaj, str):
-            await ws.close(code=1003)
-            return
-        try:
-            bilgi = json.loads(ilk_mesaj)
+            await ws.close(code=1003); return
+        try: bilgi = json.loads(ilk_mesaj)
         except json.JSONDecodeError:
-            await mesaj_gonder(ws, {"type": "error", "message": "Geçersiz JSON."})
-            return
+            await mesaj_gonder(ws, {"type": "error", "message": "Geçersiz JSON."}); return
 
-        if not isinstance(bilgi, dict):
-            return
+        if not isinstance(bilgi, dict): return
         role = bilgi.get("role")
         oda_adi = bilgi.get("room") or "oyun123"
-        if not isinstance(oda_adi, str):
-            return
+        if not isinstance(oda_adi, str): return
 
         if role == "host":
             await host_handler(ws, oda_adi, bilgi)
@@ -281,11 +250,9 @@ async def handler(ws):
             await mesaj_gonder(ws, {"type": "error", "message": "Geçersiz rol."})
     except asyncio.TimeoutError:
         logging.warning("İlk mesaj zaman aşımı")
-    except ConnectionClosed:
-        pass
+    except ConnectionClosed: pass
     except Exception as e:
         logging.warning("[HANDLER] Hata | %s", e)
-
 
 async def main():
     async with websockets.serve(
@@ -293,10 +260,9 @@ async def main():
         max_size=None,
         ping_interval=20,
         ping_timeout=30,
-        close_timeout=3,          # 5 → 3: temizlik hızlandı
+        close_timeout=3,
     ):
         await asyncio.Future()
-
 
 if __name__ == "__main__":
     asyncio.run(main())
