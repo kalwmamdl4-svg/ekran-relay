@@ -1,275 +1,222 @@
-"""Authenticated, consent-gated WebSocket relay. Set RELAY_TOKEN before starting."""
-from __future__ import annotations
-
 import asyncio
-from collections import deque
-from dataclasses import dataclass, field
-from http import HTTPStatus
-import logging
+import json
 import os
-import secrets
-import time
 import uuid
+import logging
 
-from websockets.asyncio.server import serve
+import websockets
 from websockets.exceptions import ConnectionClosed
 
-from common import VERSION, MAX_MESSAGE, FRAME, UPLOAD, DOWNLOAD, FILE_TYPES, decode, encode, unpack
+HOST = "0.0.0.0"
+PORT = int(os.environ.get("PORT", "8080"))
 
-LOG = logging.getLogger("relay")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 
+odalar = {}
 
-class AsyncOutbox:
-    def __init__(self):
-        self.cv = asyncio.Condition()
-        self.control, self.bulk = deque(), deque()
-        self.frame = None
-        self.closed = False
-        self.turn = 0
+def oda_al(oda_adi):
+    return odalar.setdefault(oda_adi, {"hosts": {}, "viewers": set()})
 
-    async def put(self, value, lane="control"):
-        async with self.cv:
-            if self.closed:
-                raise ConnectionError("closed outbox")
-            if lane == "frame":
-                self.frame = value
-            else:
-                target, limit = (self.bulk, 16) if lane == "bulk" else (self.control, 128)
-                await asyncio.wait_for(self.cv.wait_for(lambda: len(target) < limit or self.closed), 5)
-                if self.closed:
-                    raise ConnectionError("closed outbox")
-                target.append(value)
-            self.cv.notify_all()
+def durum_hesapla(idle_seconds):
+    if idle_seconds < 60: return "active"
+    if idle_seconds < 300: return "idle"
+    return "afk"
 
-    async def get(self):
-        async with self.cv:
-            await self.cv.wait_for(lambda: self.closed or self.control or self.bulk or self.frame is not None)
-            if self.closed:
-                return None
-            if self.frame is not None and self.turn % 4 == 3:
-                value, self.frame = self.frame, None
-            elif self.control and (self.turn % 4 != 2 or not self.bulk):
-                value = self.control.popleft()
-            elif self.bulk:
-                value = self.bulk.popleft()
-            elif self.frame is not None:
-                value, self.frame = self.frame, None
-            else:
-                value = self.control.popleft()
-            self.turn += 1
-            self.cv.notify_all()
-            return value
+def host_listesi_hazirla(oda_adi):
+    oda = odalar.get(oda_adi)
+    if not oda: return []
+    return [
+        {
+            "id": host_id, "name": host["name"],
+            "online_seconds": host["online_seconds"],
+            "idle_seconds": host["idle_seconds"],
+            "status": host["status"], "screen": host["screen"],
+            "busy": host["viewer"] is not None,
+        }
+        for host_id, host in oda["hosts"].items()
+    ]
 
-    async def close(self):
-        async with self.cv:
-            self.closed = True
-            self.control.clear()
-            self.bulk.clear()
-            self.frame = None
-            self.cv.notify_all()
+async def mesaj_gonder(ws, veri):
+    try:
+        await ws.send(json.dumps(veri)); return True
+    except ConnectionClosed: return False
+    except Exception as e:
+        logging.warning("Mesaj gönderilemedi: %s", e); return False
 
+async def host_listesi_gonder(oda_adi):
+    oda = odalar.get(oda_adi)
+    if not oda: return
+    veri = {"type": "host_list", "hosts": host_listesi_hazirla(oda_adi)}
+    for viewer in list(oda["viewers"]):
+        if not await mesaj_gonder(viewer, veri):
+            oda["viewers"].discard(viewer)
 
-@dataclass(eq=False)
-class Peer:
-    ws: object
-    role: str
-    room: str
-    name: str
-    host_id: str = ""
-    peer: object = None
-    session: str = ""
-    accepted: bool = False
-    since: float = field(default_factory=time.monotonic)
-    out: AsyncOutbox = field(default_factory=AsyncOutbox)
-    pending_timer: object = None
+async def hosta_baglan(viewer_ws, oda_adi, host_id):
+    oda = odalar.get(oda_adi)
+    if not oda:
+        await mesaj_gonder(viewer_ws, {"type": "error", "message": "Oda bulunamadı."}); return None
+    host = oda["hosts"].get(host_id)
+    if not host:
+        await mesaj_gonder(viewer_ws, {"type": "error", "message": "Bilgisayar çevrimiçi değil."}); return None
+    if host["viewer"] is not None and host["viewer"] is not viewer_ws:
+        await mesaj_gonder(viewer_ws, {"type": "host_busy", "host_id": host_id, "message": "Bilgisayara başka biri bağlı."}); return None
+    for hid, h in list(oda["hosts"].items()):
+        if hid != host_id and h["viewer"] is viewer_ws:
+            h["viewer"] = None
+            await mesaj_gonder(h["ws"], {"type": "peer_left"})
+    zaten_bagli = host["viewer"] is viewer_ws
+    host["viewer"] = viewer_ws
+    await mesaj_gonder(viewer_ws, {"type": "connecting", "host_id": host_id, "name": host["name"]})
+    if not zaten_bagli:
+        await mesaj_gonder(host["ws"], {"type": "viewer_joined"})
+    await host_listesi_gonder(oda_adi)
+    return host_id
 
+async def host_handler(ws, oda_adi, bilgi):
+    oda = oda_al(oda_adi)
+    host_id = bilgi.get("host_id")
+    if not isinstance(host_id, str) or not host_id.strip():
+        host_id = str(uuid.uuid4())
+    eski_host = oda["hosts"].get(host_id)
+    eski_viewer = None
+    if eski_host:
+        eski_ws = eski_host["ws"]
+        if eski_ws is not ws:
+            eski_viewer = eski_host.get("viewer")
+            try:
+                await asyncio.wait_for(eski_ws.close(code=4001, reason="Yeni HOST bağlantısı"), timeout=3)
+            except Exception: pass
+    host = {
+        "ws": ws, "name": str(bilgi.get("name") or "Bilinmeyen PC"),
+        "room": oda_adi, "online_seconds": 0, "idle_seconds": 0,
+        "status": "active", "screen": None, "viewer": eski_viewer,
+    }
+    oda["hosts"][host_id] = host
+    logging.info("[HOST] Bağlandı | Oda=%s | ID=%s | Ad=%s", oda_adi, host_id, host["name"])
+    await mesaj_gonder(ws, {"type": "registered", "host_id": host_id, "room": oda_adi})
+    if eski_viewer is not None:
+        await mesaj_gonder(eski_viewer, {"type": "peer_left"})
+        host["viewer"] = None
+    await host_listesi_gonder(oda_adi)
+    try:
+        async for mesaj in ws:
+            if oda["hosts"].get(host_id) is not host: break
+            if isinstance(mesaj, str):
+                try: veri = json.loads(mesaj)
+                except json.JSONDecodeError: veri = None
+                if isinstance(veri, dict):
+                    if veri.get("type") == "presence":
+                        host["online_seconds"] = int(veri.get("online_seconds") or 0)
+                        host["idle_seconds"] = int(veri.get("idle_seconds") or 0)
+                        host["status"] = durum_hesapla(host["idle_seconds"])
+                        host["screen"] = veri.get("screen")
+                        await host_listesi_gonder(oda_adi)
+                        continue
+            viewer = host.get("viewer")
+            if viewer is not None:
+                try:
+                    await viewer.send(mesaj)
+                except ConnectionClosed:
+                    if host["viewer"] is viewer: host["viewer"] = None
+                    await host_listesi_gonder(oda_adi)
+    except ConnectionClosed as e:
+        logging.warning("[HOST] Bağlantı kesildi | ID=%s | Kod=%s", host_id, e.code)
+    except Exception:
+        logging.exception("[HOST] Beklenmeyen hata")
+    finally:
+        if oda["hosts"].get(host_id) is host:
+            oda["hosts"].pop(host_id, None)
+            viewer = host.get("viewer")
+            if viewer is not None:
+                await mesaj_gonder(viewer, {"type": "peer_left"})
+            await host_listesi_gonder(oda_adi)
+            logging.info("[HOST] Ayrıldı | ID=%s", host_id)
 
-class Relay:
-    def __init__(self, token):
-        if not isinstance(token, str) or len(token) < 20:
-            raise ValueError("RELAY_TOKEN en az 20 karakter olmalı; secrets.token_urlsafe(32) kullanın.")
-        self.token = token
-        self.hosts = {}
-        self.peers = set()
+async def viewer_handler(ws, oda_adi):
+    oda = oda_al(oda_adi)
+    oda["viewers"].add(ws)
+    hedef_host_id = None
+    await mesaj_gonder(ws, {"type": "host_list", "hosts": host_listesi_hazirla(oda_adi)})
+    logging.info("[VIEWER] Bağlandı | Oda=%s", oda_adi)
+    try:
+        async for mesaj in ws:
+            if isinstance(mesaj, str):
+                try: veri = json.loads(mesaj)
+                except json.JSONDecodeError: veri = None
+                if isinstance(veri, dict):
+                    mesaj_tipi = veri.get("type")
+                    if mesaj_tipi == "connect_host":
+                        yeni_id = veri.get("host_id")
+                        if not yeni_id: continue
+                        yeni_hedef = await hosta_baglan(ws, oda_adi, yeni_id)
+                        if yeni_hedef: hedef_host_id = yeni_hedef
+                        continue
+                    if mesaj_tipi == "ping":
+                        await mesaj_gonder(ws, {"type": "pong", "t": veri.get("t")})
+                        continue
+                    if mesaj_tipi == "list_hosts":
+                        await mesaj_gonder(ws, {"type": "host_list", "hosts": host_listesi_hazirla(oda_adi)})
+                        continue
+                    if mesaj_tipi == "disconnect_host":
+                        if hedef_host_id:
+                            host = oda["hosts"].get(hedef_host_id)
+                            if host and host["viewer"] is ws:
+                                host["viewer"] = None
+                                await mesaj_gonder(host["ws"], {"type": "peer_left"})
+                        hedef_host_id = None
+                        await host_listesi_gonder(oda_adi)
+                        continue
+            if hedef_host_id:
+                host = oda["hosts"].get(hedef_host_id)
+                if not host or host["viewer"] is not ws:
+                    hedef_host_id = None; continue
+                try:
+                    await host["ws"].send(mesaj)
+                except ConnectionClosed:
+                    if host["viewer"] is ws: host["viewer"] = None
+                    hedef_host_id = None
+    except ConnectionClosed: pass
+    except Exception:
+        logging.exception("[VIEWER] Hata")
+    finally:
+        for host in list(oda["hosts"].values()):
+            if host["viewer"] is ws:
+                host["viewer"] = None
+                await mesaj_gonder(host["ws"], {"type": "peer_left"})
+        oda["viewers"].discard(ws)
+        await host_listesi_gonder(oda_adi)
+        logging.info("[VIEWER] Ayrıldı | Oda=%s", oda_adi)
 
-    async def send(self, peer, data, lane=None):
-        if isinstance(data, dict):
-            lane = lane or ("bulk" if data["type"] in FILE_TYPES else "control")
-            data = encode(data)
-        try:
-            await peer.out.put(data, lane or "control")
-        except (TimeoutError, ConnectionError):
-            await peer.ws.close(code=1013, reason="Alıcı çok yavaş")
-
-    async def writer(self, peer):
-        try:
-            while (data := await peer.out.get()) is not None:
-                await peer.ws.send(data)
-        except ConnectionClosed:
-            pass
-        except Exception:
-            LOG.exception("Relay writer failed")
-            await peer.ws.close(code=1011, reason="Gönderim hatası")
-
-    async def host_list(self, room):
-        hosts = [{"id": p.host_id, "name": p.name, "busy": p.peer is not None,
-                  "online_seconds": int(time.monotonic() - p.since)}
-                 for (r, _), p in self.hosts.items() if r == room]
-        await asyncio.gather(*(self.send(p, {"type": "host_list", "hosts": hosts})
-                               for p in list(self.peers) if p.role == "viewer" and p.room == room))
-
-    async def detach(self, peer, reason):
-        other = peer.peer
-        session = peer.session
-        for item in (peer, other):
-            if item is not None:
-                item.peer, item.session, item.accepted = None, "", False
-                if item.pending_timer:
-                    item.pending_timer.cancel()
-                    item.pending_timer = None
-                item.out.frame = None
-        for item in (peer, other):
-            if item is not None:
-                await self.send(item, {"type": "session_ended", "session_id": session, "reason": reason})
-        await self.host_list(peer.room)
-
-    async def request(self, viewer, host_id):
-        host = self.hosts.get((viewer.room, host_id))
-        if not host:
-            return await self.send(viewer, {"type": "error", "message": "Bilgisayar çevrimiçi değil"})
-        if host.peer is not None:
-            return await self.send(viewer, {"type": "error", "message": "Bilgisayar meşgul"})
-        if viewer.peer:
-            await self.detach(viewer, "viewer_switched")
-            if host.peer is not None:
-                return await self.send(viewer, {"type": "error", "message": "Bilgisayar meşgul"})
-        # Reserve both peers before awaiting any network-related work.
-        session = uuid.uuid4().hex
-        viewer.peer, host.peer = host, viewer
-        viewer.session = host.session = session
-        loop = asyncio.get_running_loop()
-        host.pending_timer = loop.call_later(60, lambda: asyncio.create_task(self.expire(host, session)))
-        await self.send(viewer, {"type": "connecting", "session_id": session, "host_id": host.host_id})
-        await self.send(host, {"type": "session_request", "session_id": session, "viewer_name": viewer.name})
-        await self.host_list(host.room)
-
-    async def expire(self, host, session):
-        if host.session == session and not host.accepted:
-            await self.detach(host, "approval_timeout")
-
-    async def route(self, peer, value):
-        if isinstance(value, bytes):
-            tag, session, _, _ = unpack(value)
-            if peer.peer and peer.accepted and session == peer.session:
-                allowed = (FRAME, DOWNLOAD) if peer.role == "host" else (UPLOAD,)
-                if tag not in allowed:
-                    raise ValueError("Yanlış binary yönü")
-                await self.send(peer.peer, value, "frame" if tag == FRAME else "bulk")
-            return
-        data = decode(value)
-        kind = data["type"]
-        if kind == "ping":
-            return await self.send(peer, {"type": "pong", "id": data.get("id")})
-        if peer.role == "viewer" and kind == "list_hosts":
-            return await self.host_list(peer.room)
-        if peer.role == "viewer" and kind == "connect_host":
-            return await self.request(peer, str(data.get("host_id", "")))
-        if kind == "disconnect_host":
-            if peer.peer:
-                await self.detach(peer, "host_stopped" if peer.role == "host" else "viewer_stopped")
-            return
-        if not peer.peer or data.get("session_id") != peer.session:
-            return
-        if peer.role == "host" and kind in ("session_accept", "session_reject"):
-            if kind == "session_reject":
-                return await self.detach(peer, "host_declined")
-            if peer.accepted:
-                return
-            peer.accepted = peer.peer.accepted = True
-            if peer.pending_timer:
-                peer.pending_timer.cancel()
-                peer.pending_timer = None
-            accepted = {"type": "accepted", "session_id": peer.session, "host_id": peer.host_id,
-                        "name": peer.name, "monitors": data.get("monitors", []),
-                        "permissions": data.get("permissions", {}), "shared_folder": data.get("shared_folder", "")}
-            return await self.send(peer.peer, accepted)
-        allowed = ({"ctrl", "quality", "monitor", "fs_list", "file_request", "host_ping", *FILE_TYPES}
-                   if peer.role == "viewer" else {"host_pong", "monitor_changed", "fs_list_result", "stream_stats", "error", *FILE_TYPES})
-        if peer.accepted and kind in allowed:
-            await self.send(peer.peer, data)
-
-    async def handler(self, ws):
-        peer, writer = None, None
-        try:
-            if len(self.peers) >= 128:
-                return await ws.close(code=1013, reason="Kapasite dolu")
-            raw = await asyncio.wait_for(ws.recv(), timeout=15)
-            data = decode(raw)
-            token = data.get("token", "")
-            if data.get("type") != "register" or data.get("version") != VERSION:
-                return await ws.close(code=4003, reason="Tüm dosyaları birlikte v3 sürümüne güncelleyin")
-            if not isinstance(token, str) or not secrets.compare_digest(token.encode(), self.token.encode()):
-                return await ws.close(code=4003, reason="Bağlantı anahtarı yanlış")
-            role, room = data.get("role"), data.get("room")
-            if role not in ("host", "viewer") or not isinstance(room, str) or not 1 <= len(room) <= 64:
-                raise ValueError("Geçersiz rol/oda")
-            host_id = str(data.get("host_id", ""))
-            if role == "host":
-                uuid.UUID(host_id)
-                if (room, host_id) in self.hosts:
-                    return await ws.close(code=4001, reason="Aynı host zaten bağlı; diğer kopyayı kapatın")
-            peer = Peer(ws, role, room, str(data.get("name", role))[:80], host_id)
-            self.peers.add(peer)
-            if role == "host":
-                self.hosts[(room, host_id)] = peer
-            writer = asyncio.create_task(self.writer(peer))
-            await self.send(peer, {"type": "registered", "version": VERSION, "host_id": host_id})
-            await self.host_list(room)
-            LOG.info("Bağlandı role=%s id=%s room=%s", role, host_id, room)
-            async for value in ws:
-                await self.route(peer, value)
-        except ConnectionClosed as error:
-            LOG.info("Bağlantı kapandı: %s", error)
-        except (ValueError, KeyError, TypeError, TimeoutError):
-            LOG.warning("Geçersiz protokol mesajı", exc_info=True)
-            await ws.close(code=1008, reason="Geçersiz protokol mesajı")
-        except Exception:
-            LOG.exception("Relay hatası")
-            await ws.close(code=1011, reason="Relay hatası")
-        finally:
-            if peer:
-                self.peers.discard(peer)
-                if self.hosts.get((peer.room, peer.host_id)) is peer:
-                    self.hosts.pop((peer.room, peer.host_id))
-                if peer.peer:
-                    await self.detach(peer, "peer_offline")
-                else:
-                    await self.host_list(peer.room)
-                await peer.out.close()
-            if writer:
-                writer.cancel()
-                await asyncio.gather(writer, return_exceptions=True)
-
-
-def health(connection, request):
-    if request.path == "/health":
-        return connection.respond(HTTPStatus.OK, "ok\n")
-
+async def handler(ws):
+    try:
+        ilk_mesaj = await asyncio.wait_for(ws.recv(), timeout=15)
+        if not isinstance(ilk_mesaj, str):
+            await ws.close(code=1003); return
+        try: bilgi = json.loads(ilk_mesaj)
+        except json.JSONDecodeError:
+            await mesaj_gonder(ws, {"type": "error", "message": "Geçersiz JSON."}); return
+        if not isinstance(bilgi, dict): return
+        role = bilgi.get("role")
+        oda_adi = bilgi.get("room") or "oyun123"
+        if not isinstance(oda_adi, str): return
+        if role == "host":
+            await host_handler(ws, oda_adi, bilgi)
+        elif role == "viewer":
+            await viewer_handler(ws, oda_adi)
+        else:
+            await mesaj_gonder(ws, {"type": "error", "message": "Geçersiz rol."})
+    except asyncio.TimeoutError:
+        logging.warning("İlk mesaj zaman aşımı")
+    except ConnectionClosed: pass
+    except Exception:
+        logging.exception("[HANDLER] Hata")
 
 async def main():
-    relay = Relay(os.environ.get("RELAY_TOKEN", ""))
-    async with serve(relay.handler, os.environ.get("HOST", "0.0.0.0"), int(os.environ.get("PORT", "8080")),
-                     max_size=MAX_MESSAGE, max_queue=16, write_limit=65536,
-                     ping_interval=15, ping_timeout=20, close_timeout=3, compression=None,
-                     process_request=health):
-        LOG.info("Relay hazır; health=/health")
+    async with websockets.serve(
+        handler, HOST, PORT,
+        max_size=None, ping_interval=20, ping_timeout=30, close_timeout=5
+    ):
         await asyncio.Future()
 
-
 if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        pass
-
+    asyncio.run(main())
