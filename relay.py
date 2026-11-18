@@ -7,9 +7,9 @@ import logging
 import websockets
 from websockets.exceptions import ConnectionClosed
 
-# 0.0.0.0 tüm ağlardan gelen bağlantıları dinler
+# Render ortam değişkeninden PORT'u al, yoksa 10000 kullan
+PORT = int(os.environ.get("PORT", 10000))
 HOST = "0.0.0.0"
-PORT = 8080
 
 logging.basicConfig(
     level=logging.INFO,
